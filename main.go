@@ -63,7 +63,7 @@ const (
 	NullMoveReduction    = 2                // Reduction amount for NMP
 	MovesLeft            = 40               // When movestogo = 0
 	movetimeSafetyMs     = 50               // Taken from time allocated to account for overhead
-
+	mateThreshold        = mateScore - maxSearchDepth // Score for mate detection
 )
 
 // Search state
@@ -554,8 +554,7 @@ func (pos *Position) addPiece(sq, p int) {
 			pos.MgScore[c] += bishopPairMg
 			pos.EgScore[c] += bishopPairEg
 		}
-	}
-	if p == WKing || p == BKing {
+	case WKing, BKing:
 		pos.KingSq[c] = sq
 	}
 }
@@ -616,9 +615,7 @@ func (pos *Position) movePiece(from, to int) {
 			pos.applyRookFileChange(c, fFrom, -1)
 			pos.applyRookFileChange(c, fTo, +1)
 		}
-	}
-
-	if p == WKing || p == BKing {
+	case WKing, BKing:
 		pos.KingSq[c] = to
 	}
 }
@@ -1187,10 +1184,10 @@ func clearTT() {
 
 // Adjust scores if mate scores (storing)
 func ttAdjustStore(score, ply int) int16 {
-	if score > mateScore-maxSearchDepth {
+	if score > mateThreshold {
 		return int16(score + ply)
 	}
-	if score < -(mateScore - maxSearchDepth) {
+	if score < -mateThreshold {
 		return int16(score - ply)
 	}
 	return int16(score)
@@ -1199,10 +1196,10 @@ func ttAdjustStore(score, ply int) int16 {
 // Adjust scores if mate scores (retrieving)
 func ttAdjustRetrieve(stored int16, ply int) int {
 	score := int(stored)
-	if score > mateScore-maxSearchDepth {
+	if score > mateThreshold {
 		return score - ply
 	}
-	if score < -(mateScore - maxSearchDepth) {
+	if score < -mateThreshold {
 		return score + ply
 	}
 	return score
@@ -1228,11 +1225,11 @@ func ttStore(hash uint64, move Move, score, depth, ply int, flag uint8) {
 
 // Format score if mate
 func formatScore(score int) string {
-	if score > mateScore-maxSearchDepth {
+	if score > mateThreshold {
 		plies := mateScore - score
 		return fmt.Sprintf("mate %d", (plies+1)/2)
 	}
-	if score < -(mateScore - maxSearchDepth) {
+	if score < -mateThreshold {
 		plies := mateScore + score
 		return fmt.Sprintf("mate -%d", (plies+1)/2)
 	}
@@ -1275,6 +1272,15 @@ func updateHistory(side int, moves []Move, cutoffIdx, depth int) {
 // --- Search ---
 // --------------
 
+// Increment node counter, check time, return true if search should stop
+func tickNodes() bool {
+	if nodes&timeCheckMask == 0 {
+		checkTime()
+	}
+	nodes++
+	return abortSearch.Load()
+}
+
 // Check time limit
 func checkTime() {
 	if useTime && time.Now().After(stopTime) {
@@ -1284,14 +1290,7 @@ func checkTime() {
 
 // Search until no captures
 func quiescence(pos *Position, alpha, beta int) int {
-	// Check time
-	if nodes&timeCheckMask == 0 {
-		checkTime()
-	}
-	// Increment nodes
-	nodes++
-	// Check if search should stop
-	if abortSearch.Load() {
+	if tickNodes() {
 		return 0
 	}
 	// Check draws
@@ -1346,15 +1345,7 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 	// Clear PV line
 	*pvLine = nil
 
-	// Check nodes
-	if nodes&timeCheckMask == 0 {
-		checkTime()
-	}
-	// Increment nodes
-	nodes++
-	// Check if should stop
-	if abortSearch.Load() {
-		// Can return 0 as it wont be used
+	if tickNodes() {
 		return 0
 	}
 
@@ -1396,13 +1387,13 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 	}
 
 	// Null move pruning
-	if !inCheck && depth >= 3 && ply > 0 && beta < mateScore-maxSearchDepth && pos.nonPawnPhase(pos.Side) > 0 {
+	if !inCheck && depth >= 3 && ply > 0 && beta < mateThreshold && pos.nonPawnPhase(pos.Side) > 0 {
 		var nullUndo UndoInfo
 		pos.makeNullMove(&nullUndo)
 		var nullPv []Move
 		score := -alphaBeta(pos, -beta, -beta+1, depth-1-NullMoveReduction, ply+1, NoMove, &nullPv)
 		pos.unmakeNullMove(&nullUndo)
-		// Check if searchshould stop
+		// Check if search should stop
 		if abortSearch.Load() {
 			return 0
 		}
