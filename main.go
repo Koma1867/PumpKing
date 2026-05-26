@@ -91,6 +91,11 @@ func waitForSearch() {
 // (to)
 var history [2][128][128]int
 
+// Killer moves
+// (ply)
+// (0=primary, 1=secondary)
+var killers [maxSearchDepth][2]Move
+
 // Castle rights bits
 const (
 	WKCastle = 1
@@ -153,9 +158,11 @@ var pstEg [13][128]int
 
 // Ordering constants
 const (
-	scorePVMove   = 10_000_000 // PV move
-	scoreCapBase  = 1_000_000  // Base score for captures
-	mvvMultiplier = 100        // Victim value multiplier
+	scorePVMove   = 10_000_000        // PV move
+	scoreCapBase  = 1_000_000         // Base score for captures
+	scoreKillerA  = scoreCapBase + 50 // Killer A slot, just below worst capture
+	scoreKillerB  = scoreCapBase + 10 // Killer B slot
+	mvvMultiplier = 100               // Victim value multiplier
 )
 
 // MVV-LVA lookup values
@@ -1124,7 +1131,7 @@ func (pos *Position) evaluate() int {
 // ---------------------
 
 // Assign ordering scores
-func scoreMove(pos *Position, m Move, pvMove, ttMove Move, side int) int {
+func scoreMove(pos *Position, m Move, pvMove, ttMove Move, ply, side int) int {
 	// Previous best move?
 	if m == pvMove {
 		return scorePVMove
@@ -1138,6 +1145,14 @@ func scoreMove(pos *Position, m Move, pvMove, ttMove Move, side int) int {
 		victim := m.captured()
 		attacker := pos.Board[m.from()]
 		return mvvLvaVal[victim]*mvvMultiplier - mvvLvaVal[attacker] + scoreCapBase
+	}
+	// Killer A?
+	if m == killers[ply][0] {
+		return scoreKillerA
+	}
+	// Killer B?
+	if m == killers[ply][1] {
+		return scoreKillerB
 	}
 	// History score
 	return history[side][m.from()][m.to()]
@@ -1311,7 +1326,7 @@ func quiescence(pos *Position, alpha, beta int) int {
 	var scoreBuf [maxMoves]int
 	scores := scoreBuf[:len(moves)]
 	for i, m := range moves {
-		scores[i] = scoreMove(pos, m, NoMove, NoMove, pos.Side)
+		scores[i] = scoreMove(pos, m, NoMove, NoMove, 0, pos.Side)
 	}
 
 	var undo UndoInfo
@@ -1414,7 +1429,7 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 	scores := scoreBuf[:len(moves)]
 	// Order moves
 	for i, m := range moves {
-		scores[i] = scoreMove(pos, m, pvMove, ttMove, pos.Side)
+		scores[i] = scoreMove(pos, m, pvMove, ttMove, ply, pos.Side)
 	}
 
 	var undo UndoInfo
@@ -1471,6 +1486,11 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 			if !m.isCapture() {
 				// Update history
 				updateHistory(mover, moves, i, depth)
+				// Update killers: shift A to B, put new move in A (skip if already A)
+				if killers[ply][0] != m {
+					killers[ply][1] = killers[ply][0]
+					killers[ply][0] = m
+				}
 			}
 			ttStore(pos.Hash, m, beta, depth, ply, ttBeta)
 			return beta
@@ -1504,6 +1524,8 @@ func search(pos *Position, maxDepth int, maxNodes uint64) Move {
 	abortSearch.Store(false)
 	// Age history values
 	ageHistory()
+	// Clear killers (they are local to one search)
+	killers = [maxSearchDepth][2]Move{}
 
 	var bestMove Move
 	var globalPv []Move
