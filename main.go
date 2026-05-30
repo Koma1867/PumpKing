@@ -48,21 +48,20 @@ const (
 
 // Search constants
 const (
-	infScore             = 32000            // Score larger than any eval
-	mateScore            = 30000            // Base mate score
-	timeCheckMask        = 511              // Clock check node count
-	maxSearchDepth       = 64               // Max search depth
-	maxMoves             = 256              // Max legal moves
-	aspirationDelta      = 25               // Aspiration window initial half-size
-	aspirationMaxRetries = 8                // Max aspiration retries
-	lmrMinLegalMoves     = 3                // min LMR moves
-	lmrMinDepth          = 3                // min LMR depth
-	lmrDepthBumpAt       = 6                // Reduction + 1
-	lmrLegalBumpAt       = 6                // Reduction + 1
-	lmrHistoryThreshold  = scoreCapBase / 4 // Less reduction for good history moves
-	NullMoveReduction    = 2                // Reduction amount for NMP
-	MovesLeft            = 40               // When movestogo = 0
-	movetimeSafetyMs     = 50               // Taken from time allocated to account for overhead
+	infScore             = 32000                      // Score larger than any eval
+	mateScore            = 30000                      // Base mate score
+	timeCheckMask        = 511                        // Clock check node count
+	maxSearchDepth       = 64                         // Max search depth
+	maxMoves             = 256                        // Max legal moves
+	aspirationDelta      = 25                         // Aspiration window initial half-size
+	aspirationMaxRetries = 8                          // Max aspiration retries
+	lmrMinLegalMoves     = 3                          // min LMR moves
+	lmrMinDepth          = 3                          // min LMR depth
+	lmrDepthBumpAt       = 6                          // Reduction + 1
+	lmrLegalBumpAt       = 6                          // Reduction + 1
+	NullMoveReduction    = 2                          // Reduction amount for NMP
+	MovesLeft            = 40                         // When movestogo = 0
+	movetimeSafetyMs     = 50                         // Taken from time allocated to account for overhead
 	mateThreshold        = mateScore - maxSearchDepth // Score for mate detection
 )
 
@@ -909,7 +908,8 @@ func (pos *Position) makeMove(m Move, undo *UndoInfo) bool {
 
 	p := pos.Board[to]
 
-	if p == WPawn || p == BPawn || capP != Empty {
+	// Reset halfmove clock if pawn, capture or promotion
+	if p == WPawn || p == BPawn || capP != Empty || prom != Empty {
 		pos.HalfMove = 0
 	} else {
 		pos.HalfMove++
@@ -1316,9 +1316,12 @@ func quiescence(pos *Position, alpha, beta int) int {
 	// Stand pat
 	standPat := pos.evaluate()
 	if standPat >= beta {
-		return beta
+		return standPat
 	}
-	alpha = max(alpha, standPat)
+	bestScore := standPat
+	if standPat > alpha {
+		alpha = standPat
+	}
 
 	// Generate only captures for quiescence
 	var moveBuf [maxMoves]Move
@@ -1345,14 +1348,17 @@ func quiescence(pos *Position, alpha, beta int) int {
 			return 0
 		}
 
-		if score >= beta {
-			return beta
-		}
-		if score > alpha {
-			alpha = score
+		if score > bestScore {
+			bestScore = score
+			if score > alpha {
+				alpha = score
+			}
+			if score >= beta {
+				break
+			}
 		}
 	}
-	return alpha
+	return bestScore
 }
 
 // Search through moves with negamax
@@ -1413,7 +1419,11 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 			return 0
 		}
 		if score >= beta {
-			return beta
+			// Dont propagate an unproven mate score from a null move.
+			if score >= mateThreshold {
+				return beta
+			}
+			return score
 		}
 	}
 
@@ -1434,8 +1444,9 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 
 	var undo UndoInfo
 	legalMoves := 0
-	ttFlag := ttAlpha
 	var bestMove Move
+	bestScore := -infScore
+	origAlpha := alpha
 
 	for i := 0; i < len(moves); i++ {
 		sortMoves(moves, scores, i)
@@ -1447,33 +1458,38 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 		}
 		legalMoves++
 
-		// Late move reductions
+		// Principal Variation Search.
 		var line []Move
-		nd := depth - 1
-		if legalMoves > lmrMinLegalMoves && depth >= lmrMinDepth && !m.isCapture() && m.promoted() == Empty && !inCheck {
-			R := 1
-			// Depth higher than or equal to 6?
-			if depth >= lmrDepthBumpAt {
-				R++
-			}
-			// Moves higher than or 6?
-			if legalMoves >= lmrLegalBumpAt {
-				R++
-			}
-			// Reduce less for good history moves
-			if history[mover][m.from()][m.to()] > lmrHistoryThreshold {
-				R--
-			}
-			// TODO: Test if R < 0 is better (don't reduce good history at all)
-			if R < 1 {
-				R = 1
-			}
-			nd = max(depth-1-R, 1)
-		}
-		score := -alphaBeta(pos, -beta, -alpha, nd, ply+1, NoMove, &line)
-		if nd < depth-1 && score > alpha {
-			line = nil
+		var score int
+		if legalMoves == 1 {
 			score = -alphaBeta(pos, -beta, -alpha, depth-1, ply+1, NoMove, &line)
+		} else {
+			// Late move reductions
+			nd := depth - 1
+			if legalMoves > lmrMinLegalMoves && depth >= lmrMinDepth && !m.isCapture() && m.promoted() == Empty && !inCheck {
+				R := 1
+				// Depth higher than or equal to 6?
+				if depth >= lmrDepthBumpAt {
+					R++
+				}
+				// Moves higher than or 6?
+				if legalMoves >= lmrLegalBumpAt {
+					R++
+				}
+				nd = max(depth-1-R, 1)
+			}
+			// Null-window scout
+			score = -alphaBeta(pos, -alpha-1, -alpha, nd, ply+1, NoMove, &line)
+			// Beat alpha while reduced? Re-search full depth
+			if score > alpha && nd < depth-1 {
+				line = nil
+				score = -alphaBeta(pos, -alpha-1, -alpha, depth-1, ply+1, NoMove, &line)
+			}
+			// Beat alpha at a PV node? Re-search full window
+			if score > alpha && score < beta {
+				line = nil
+				score = -alphaBeta(pos, -beta, -alpha, depth-1, ply+1, NoMove, &line)
+			}
 		}
 		pos.unmakeMove(m, &undo)
 
@@ -1482,30 +1498,32 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 			return 0
 		}
 
-		if score >= beta {
-			if !m.isCapture() {
-				// Update history
-				updateHistory(mover, moves, i, depth)
-				// Update killers: shift A to B, put new move in A (skip if already A)
-				if killers[ply][0] != m {
-					killers[ply][1] = killers[ply][0]
-					killers[ply][0] = m
+		if score > bestScore {
+			bestScore = score
+			bestMove = m
+			if score > alpha {
+				alpha = score
+				if score < beta {
+					// New principal variation at a PV node
+					*pvLine = append([]Move{m}, line...)
+				} else {
+					// Fail-high beta cutoff
+					if !m.isCapture() {
+						updateHistory(mover, moves, i, depth)
+						if killers[ply][0] != m {
+							killers[ply][1] = killers[ply][0]
+							killers[ply][0] = m
+						}
+					}
+					break
 				}
 			}
-			ttStore(pos.Hash, m, beta, depth, ply, ttBeta)
-			return beta
-		}
-		if score > alpha {
-			alpha = score
-			ttFlag = ttExact
-			bestMove = m
-			*pvLine = append([]Move{m}, line...)
 		}
 	}
 
 	// 0 moves, so either draw or mate
 	if legalMoves == 0 {
-		if pos.isSquareAttacked(pos.KingSq[pos.Side], pos.Side^1) {
+		if inCheck {
 			score := -mateScore + ply
 			ttStore(pos.Hash, NoMove, score, depth, ply, ttExact)
 			return score
@@ -1514,8 +1532,15 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 		return 0 // Stalemate
 	}
 
-	ttStore(pos.Hash, bestMove, alpha, depth, ply, ttFlag)
-	return alpha
+	// TT flag
+	flag := ttAlpha
+	if bestScore >= beta {
+		flag = ttBeta
+	} else if bestScore > origAlpha {
+		flag = ttExact
+	}
+	ttStore(pos.Hash, bestMove, bestScore, depth, ply, flag)
+	return bestScore
 }
 
 // Search through depths
