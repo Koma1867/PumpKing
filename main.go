@@ -60,6 +60,8 @@ const (
 	lmrDepthBumpAt       = 6                          // Reduction + 1
 	lmrLegalBumpAt       = 6                          // Reduction + 1
 	NullMoveReduction    = 2                          // Reduction amount for NMP
+	rfpMaxDepth          = 6                          // Max depth for reverse futility pruning
+	rfpMargin            = 80                         // Margin per depth for reverse futility pruning
 	MovesLeft            = 40                         // When movestogo = 0
 	movetimeSafetyMs     = 50                         // Taken from time allocated to account for overhead
 	mateThreshold        = mateScore - maxSearchDepth // Score for mate detection
@@ -1393,6 +1395,14 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 	inCheck := pos.isSquareAttacked(pos.KingSq[pos.Side], pos.Side^1)
 	if inCheck {
 		depth++
+	}
+
+	// Reverse futility pruning
+	if !inCheck && beta-alpha == 1 && depth <= rfpMaxDepth && beta < mateThreshold {
+		staticEval := pos.evaluate()
+		if staticEval-rfpMargin*depth >= beta {
+			return staticEval
+		}
 	}
 
 	// Null move pruning
