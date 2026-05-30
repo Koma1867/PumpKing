@@ -244,7 +244,6 @@ type Position struct {
 	CastleRights int       // Castle bitmask
 	EpSquare     int       // En passant
 	HalfMove     int       // Halfmove clock
-	FullMove     int       // Full move counter
 	KingSq       [2]int    // King square
 	MgScore      [2]int    // Middlegame score
 	EgScore      [2]int    // Endgame Score
@@ -690,15 +689,9 @@ func (pos *Position) parseFEN(fen string) {
 		}
 	}
 
-	// Halfmove and fullmove
+	// Halfmove clock
 	if len(parts) > 4 {
 		pos.HalfMove, _ = strconv.Atoi(parts[4])
-	}
-	if len(parts) > 5 {
-		pos.FullMove, _ = strconv.Atoi(parts[5])
-	}
-	if pos.FullMove == 0 {
-		pos.FullMove = 1
 	}
 }
 
@@ -932,9 +925,6 @@ func (pos *Position) makeMove(m Move, undo *UndoInfo) bool {
 
 	pos.Side ^= 1
 	pos.Hash ^= zobristSide
-	if pos.Side == White {
-		pos.FullMove++
-	}
 
 	// Legality check
 	kingSq := pos.KingSq[pos.Side^1]
@@ -947,9 +937,7 @@ func (pos *Position) makeMove(m Move, undo *UndoInfo) bool {
 }
 
 func (pos *Position) unmakeMove(m Move, undo *UndoInfo) {
-	if pos.Side == White {
-		pos.FullMove--
-	}
+
 	pos.Side ^= 1
 
 	from := m.from()
@@ -1131,7 +1119,7 @@ func (pos *Position) evaluate() int {
 // ---------------------
 
 // Assign ordering scores
-func scoreMove(pos *Position, m Move, pvMove, ttMove Move, ply, side int) int {
+func scoreMove(pos *Position, m Move, pvMove, ttMove Move, ply int) int {
 	// Previous best move?
 	if m == pvMove {
 		return scorePVMove
@@ -1155,7 +1143,7 @@ func scoreMove(pos *Position, m Move, pvMove, ttMove Move, ply, side int) int {
 		return scoreKillerB
 	}
 	// History score
-	return history[side][m.from()][m.to()]
+	return history[pos.Side][m.from()][m.to()]
 }
 
 // Sort moves based on scores given
@@ -1329,7 +1317,7 @@ func quiescence(pos *Position, alpha, beta int) int {
 	var scoreBuf [maxMoves]int
 	scores := scoreBuf[:len(moves)]
 	for i, m := range moves {
-		scores[i] = scoreMove(pos, m, NoMove, NoMove, 0, pos.Side)
+		scores[i] = scoreMove(pos, m, NoMove, NoMove, 0)
 	}
 
 	var undo UndoInfo
@@ -1439,7 +1427,7 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 	scores := scoreBuf[:len(moves)]
 	// Order moves
 	for i, m := range moves {
-		scores[i] = scoreMove(pos, m, pvMove, ttMove, ply, pos.Side)
+		scores[i] = scoreMove(pos, m, pvMove, ttMove, ply)
 	}
 
 	var undo UndoInfo
