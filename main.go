@@ -241,20 +241,23 @@ type UndoInfo struct {
 
 // Complete board state
 type Position struct {
-	Board        [128]int  // Full board
-	Side         int       // White or black
-	CastleRights int       // Castle bitmask
-	EpSquare     int       // En passant
-	HalfMove     int       // Halfmove clock
-	KingSq       [2]int    // King square
-	MgScore      [2]int    // Middlegame score
-	EgScore      [2]int    // Endgame Score
-	Phase        int       // Game phase
-	Hash         uint64    // Hash of position
-	History      []uint64  // History for repetition
-	PieceCnt     [13]int   // Piece count
-	PawnFileCnt  [2][8]int // Pawns per file
-	RookFileCnt  [2][8]int // Rooks per file
+	Board         [128]int   // Full board
+	Side          int        // White or black
+	CastleRights  int        // Castle bitmask
+	EpSquare      int        // En passant
+	HalfMove      int        // Halfmove clock
+	KingSq        [2]int     // King square
+	MgScore       [2]int     // Middlegame score
+	EgScore       [2]int     // Endgame Score
+	Phase         int        // Game phase
+	Hash          uint64     // Hash of position
+	History       []uint64   // History for repetition
+	PieceCnt      [13]int    // Piece count
+	PawnFileCnt   [2][8]int  // Pawns per file
+	RookFileCnt   [2][8]int  // Rooks per file
+	PieceList     [2][16]int // Squares of each side's pieces
+	PieceListSize [2]int     // Number of pieces per side
+	PieceIndex    [128]int   // Square -> index into its side's PieceList
 }
 
 // --------------------------
@@ -548,6 +551,10 @@ func (pos *Position) addPiece(sq, p int) {
 	pos.Phase += phaseValues[p]
 	pos.Hash ^= zobristPieces[p][sq]
 	pos.PieceCnt[p]++
+	// Piece list
+	pos.PieceList[c][pos.PieceListSize[c]] = sq
+	pos.PieceIndex[sq] = pos.PieceListSize[c]
+	pos.PieceListSize[c]++
 	switch p {
 	case WPawn, BPawn:
 		// Pawns (iso, doubled)
@@ -575,6 +582,12 @@ func (pos *Position) removePiece(sq int) {
 	pos.Phase -= phaseValues[p]
 	pos.Hash ^= zobristPieces[p][sq]
 	pos.PieceCnt[p]--
+	// Piece list
+	pos.PieceListSize[c]--
+	last := pos.PieceList[c][pos.PieceListSize[c]]
+	idx := pos.PieceIndex[sq]
+	pos.PieceList[c][idx] = last
+	pos.PieceIndex[last] = idx
 	switch p {
 	case WPawn, BPawn:
 		// Pawns (iso, doubled)
@@ -602,6 +615,11 @@ func (pos *Position) movePiece(from, to int) {
 
 	pos.Board[from] = Empty // Set from square to empty
 	pos.Board[to] = p       // Set to square to piece
+
+	// Piece list
+	plIdx := pos.PieceIndex[from]
+	pos.PieceList[c][plIdx] = to
+	pos.PieceIndex[to] = plIdx
 
 	pos.MgScore[c] += pstMg[p][to]
 	pos.EgScore[c] += pstEg[p][to]
@@ -746,15 +764,10 @@ func (pos *Position) generateMoves(buf []Move, capturesOnly bool) []Move {
 	side := pos.Side
 	enemy := side ^ 1
 
-	// Loop over squares
-	for sq := 0; sq < 128; sq++ {
-		if !isSqValid(sq) {
-			continue
-		}
+	// Loop over this side's pieces via the piece list
+	for idx := 0; idx < pos.PieceListSize[side]; idx++ {
+		sq := pos.PieceList[side][idx]
 		p := pos.Board[sq]
-		if p == Empty || pieceColor(p) != side {
-			continue
-		}
 
 		// Pawns
 		switch p {
