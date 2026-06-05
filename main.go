@@ -46,6 +46,9 @@ const (
 	Black = 1
 )
 
+// Starting position FEN
+const startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
 // Search constants
 const (
 	infScore             = 32000                      // Score larger than any eval
@@ -77,12 +80,12 @@ var (
 	searchDone chan struct{} // Closed after search has completed
 )
 
-// Waits for current search to finish
+// Abort the search and wait for it to exit
 func waitForSearch() {
-	if searchDone != nil { // Check if search is active
-		abortSearch.Store(true) // Make search stop
-		<-searchDone            // Waits for search to exit
-		searchDone = nil        // Set back to nil
+	if searchDone != nil {
+		abortSearch.Store(true) // tell the search goroutine to stop
+		<-searchDone            // wait for it to close the channel
+		searchDone = nil
 	}
 }
 
@@ -185,11 +188,16 @@ const (
 	isolatedPawnEg     = -10 // Penalty for iso pawn in EG
 )
 
-// Bit masks
+// Move bit layout, from(7) | to(7) | captured(4) | promoted(4) | flag(3)
 const (
 	maskSq    = 0x7F // 7-bit square mask
 	maskPiece = 0xF  // 4-bit piece mask
 	maskFlag  = 0x7  // 3-bit flag mask
+
+	shiftTo       = 7  // to field offset
+	shiftCaptured = 14 // captured field offset
+	shiftPromoted = 18 // promoted field offset
+	shiftFlag     = 22 // flag field offset
 )
 
 // Move offset variables
@@ -208,15 +216,15 @@ var pawnAttacks [2][128][]int
 
 // Move encoding
 func makeMoveEncoded(from, to, captured, promoted, flag int) Move {
-	return Move(from | (to << 7) | (captured << 14) | (promoted << 18) | (flag << 22))
+	return Move(from | (to << shiftTo) | (captured << shiftCaptured) | (promoted << shiftPromoted) | (flag << shiftFlag))
 }
 
 // Move decoding
 func (m Move) from() int       { return int(m & maskSq) }
-func (m Move) to() int         { return int((m >> 7) & maskSq) }
-func (m Move) captured() int   { return int((m >> 14) & maskPiece) }
-func (m Move) promoted() int   { return int((m >> 18) & maskPiece) }
-func (m Move) flag() int       { return int((m >> 22) & maskFlag) }
+func (m Move) to() int         { return int((m >> shiftTo) & maskSq) }
+func (m Move) captured() int   { return int((m >> shiftCaptured) & maskPiece) }
+func (m Move) promoted() int   { return int((m >> shiftPromoted) & maskPiece) }
+func (m Move) flag() int       { return int((m >> shiftFlag) & maskFlag) }
 func (m Move) isCapture() bool { return m.captured() != Empty }
 
 // Move string
@@ -269,6 +277,7 @@ func rankOf(sq int) int       { return sq >> 4 }            // Extract rank
 func fileOf(sq int) int       { return sq & 7 }             // Extract file
 func isSqValid(sq int) bool   { return (sq & 0x88) == 0 }   // Off-board check via nibble
 func flipSq(sq int) int       { return sq ^ 0x70 }          // Mirror square vertically
+func pawnPush(side int) int   { return 16 - side*32 }       // +16 White, -16 Black
 
 // Piece colors per piece
 var pieceColorTable = [13]int{-1, White, White, White, White, White, White, Black, Black, Black, Black, Black, Black}
@@ -298,7 +307,7 @@ var (
 
 // Initialize zobrist hashes
 func initZobrist() {
-	var seed uint64 = 69      // Random seed
+	var seed uint64 = 69      // XORShift seed (funni)
 	rand64 := func() uint64 { // XORShift
 		seed ^= seed << 13
 		seed ^= seed >> 7
@@ -307,17 +316,17 @@ func initZobrist() {
 	}
 
 	// Loop pieces
-	for p := 0; p < 13; p++ {
-		for sq := 0; sq < 128; sq++ {
+	for p := range zobristPieces {
+		for sq := range zobristPieces[p] {
 			zobristPieces[p][sq] = rand64()
 		}
 	}
 	// Get castle and en passant
 	zobristSide = rand64()
-	for i := 0; i < 16; i++ {
+	for i := range zobristCastle {
 		zobristCastle[i] = rand64()
 	}
-	for sq := 0; sq < 128; sq++ {
+	for sq := range zobristEp {
 		zobristEp[sq] = rand64()
 	}
 }
@@ -327,40 +336,22 @@ func initZobrist() {
 // ---------------------
 
 func initLeaperTables() {
-	// Loop over squares
-	for sq := 0; sq < 128; sq++ {
-		// Filter out illegals
+	// Append every board target sq+dir to dst
+	add := func(dst *[]int, sq int, dirs []int) {
+		for _, d := range dirs {
+			if to := sq + d; isSqValid(to) {
+				*dst = append(*dst, to)
+			}
+		}
+	}
+	for sq := range knightTargets {
 		if !isSqValid(sq) {
 			continue
 		}
-		// Knights
-		for _, d := range knightDirs {
-			// No illegals
-			if to := sq + d; isSqValid(to) {
-				knightTargets[sq] = append(knightTargets[sq], to)
-			}
-		}
-		// Kings
-		for _, d := range kingDirs {
-			// No illegals here either
-			if to := sq + d; isSqValid(to) {
-				kingTargets[sq] = append(kingTargets[sq], to)
-			}
-		}
-		// Pawns white
-		for _, d := range []int{15, 17} {
-			// Nor here
-			if to := sq + d; isSqValid(to) {
-				pawnAttacks[White][sq] = append(pawnAttacks[White][sq], to)
-			}
-		}
-		// Pawns Black
-		for _, d := range []int{-15, -17} {
-			// Or here
-			if to := sq + d; isSqValid(to) {
-				pawnAttacks[Black][sq] = append(pawnAttacks[Black][sq], to)
-			}
-		}
+		add(&knightTargets[sq], sq, knightDirs)
+		add(&kingTargets[sq], sq, kingDirs)
+		add(&pawnAttacks[White][sq], sq, []int{15, 17})  // white attacks up the board
+		add(&pawnAttacks[Black][sq], sq, []int{-15, -17}) // black attacks down
 	}
 }
 
@@ -498,24 +489,17 @@ var rawPstEg = [7][64]int{
 
 // Initialize piece square tables, add in materials and mirror for black
 func initPST() {
-	// Place material values into piece square tables
+	// Bake material into the PSTs, black is white mirrored vertically
 	for p := WPawn; p <= WKing; p++ {
-		for r := 0; r < 8; r++ {
-			for f := 0; f < 8; f++ {
-				sq64 := r*8 + f
-				sq88Idx := sq88(r, f)
-
-				// White
-				pstMg[p][sq88Idx] = rawPstMg[p][sq64] + materialMg[p]
-				pstEg[p][sq88Idx] = rawPstEg[p][sq64] + materialEg[p]
-
-				// Black
-				// Mirror with flipsq
-				bp := p + 6
-				bsq88Idx := flipSq(sq88Idx)
-				pstMg[bp][bsq88Idx] = rawPstMg[p][sq64] + materialMg[p]
-				pstEg[bp][bsq88Idx] = rawPstEg[p][sq64] + materialEg[p]
-			}
+		for sq64 := range rawPstMg[p] {
+			mg := rawPstMg[p][sq64] + materialMg[p]
+			eg := rawPstEg[p][sq64] + materialEg[p]
+			w := sq88(sq64/8, sq64%8)
+			b := flipSq(w)
+			pstMg[p][w] = mg
+			pstEg[p][w] = eg
+			pstMg[p+6][b] = mg
+			pstEg[p+6][b] = eg
 		}
 	}
 }
@@ -530,7 +514,7 @@ var castleMask = [128]int{}
 // Initialize castle mask so we don't need to compute inside move making
 func initCastleMask() {
 	// Loop through squares
-	for i := 0; i < 128; i++ {
+	for i := range castleMask {
 		castleMask[i] = WKCastle | WQCastle | BKCastle | BQCastle
 	}
 	// Set masks
@@ -649,10 +633,6 @@ func (pos *Position) movePiece(from, to int) {
 func (pos *Position) parseFEN(fen string) {
 	*pos = Position{EpSquare: -1, History: make([]uint64, 0, 256)}
 	parts := strings.Split(fen, " ")
-	// No parts?
-	if len(parts) < 1 {
-		return
-	}
 
 	// Piece placement
 	rank, file := 7, 0
@@ -682,18 +662,11 @@ func (pos *Position) parseFEN(fen string) {
 		pos.Hash ^= zobristSide
 	}
 
-	// Castling rights
+	// Castling rights ("KQkq" → bits WKCastle..BQCastle = 1,2,4,8)
 	if len(parts) > 2 {
 		for i := 0; i < len(parts[2]); i++ {
-			switch parts[2][i] {
-			case 'K':
-				pos.CastleRights |= WKCastle
-			case 'Q':
-				pos.CastleRights |= WQCastle
-			case 'k':
-				pos.CastleRights |= BKCastle
-			case 'q':
-				pos.CastleRights |= BQCastle
+			if n := strings.IndexByte("KQkq", parts[2][i]); n >= 0 {
+				pos.CastleRights |= 1 << n
 			}
 		}
 	}
@@ -714,9 +687,6 @@ func (pos *Position) parseFEN(fen string) {
 		pos.HalfMove, _ = strconv.Atoi(parts[4])
 	}
 }
-
-// Starting position FEN
-const startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
 // -----------------------
 // --- Move Generation ---
@@ -769,10 +739,10 @@ func (pos *Position) generateMoves(buf []Move, capturesOnly bool) []Move {
 		sq := pos.PieceList[side][idx]
 		p := pos.Board[sq]
 
-		// Pawns
 		switch p {
 		case WPawn, BPawn:
-			push := 16 - side*32    // +16 White, -16 Black
+			// Pawns
+			push := pawnPush(side)
 			promoRank := 6 - side*5 // rank 6 White, rank 1 Black
 			startRank := 1 + side*5 // rank 1 White, rank 6 Black
 			if !capturesOnly && isSqValid(sq+push) && pos.Board[sq+push] == Empty {
@@ -882,6 +852,14 @@ func (pos *Position) isSquareAttacked(sq int, bySide int) bool {
 // --------------------------
 // NOTE: If swap to Neural networks rewrite this to copy & make
 
+// Clear en passant from hash and state
+func (pos *Position) clearEP() {
+	if pos.EpSquare != -1 {
+		pos.Hash ^= zobristEp[pos.EpSquare]
+		pos.EpSquare = -1
+	}
+}
+
 // Make move on board
 func (pos *Position) makeMove(m Move, undo *UndoInfo) bool {
 	undo.CastleRights = pos.CastleRights
@@ -897,10 +875,7 @@ func (pos *Position) makeMove(m Move, undo *UndoInfo) bool {
 
 	pos.History = append(pos.History, pos.Hash)
 
-	if pos.EpSquare != -1 {
-		pos.Hash ^= zobristEp[pos.EpSquare]
-		pos.EpSquare = -1
-	}
+	pos.clearEP()
 	pos.Hash ^= zobristCastle[pos.CastleRights]
 
 	if capP != Empty && flag != FlagEP {
@@ -925,10 +900,10 @@ func (pos *Position) makeMove(m Move, undo *UndoInfo) bool {
 
 	switch flag {
 	case FlagDoublePush:
-		pos.EpSquare = from + 16 - pos.Side*32
+		pos.EpSquare = from + pawnPush(pos.Side)
 		pos.Hash ^= zobristEp[pos.EpSquare]
 	case FlagEP:
-		pos.removePiece(to - 16 + pos.Side*32)
+		pos.removePiece(to - pawnPush(pos.Side))
 	case FlagCastle:
 		r := rankOf(to)
 		f := fileOf(to) >> 2
@@ -974,7 +949,7 @@ func (pos *Position) unmakeMove(m Move, undo *UndoInfo) {
 
 	switch flag {
 	case FlagEP:
-		pos.addPiece(to-16+pos.Side*32, BPawn-pos.Side*6)
+		pos.addPiece(to-pawnPush(pos.Side), BPawn-pos.Side*6)
 	case FlagCastle:
 		r := rankOf(to)
 		f := fileOf(to) >> 2
@@ -1002,10 +977,7 @@ func (pos *Position) nonPawnPhase(side int) int {
 func (pos *Position) makeNullMove(undo *UndoInfo) {
 	undo.EpSquare = pos.EpSquare
 	undo.Hash = pos.Hash
-	if pos.EpSquare != -1 {
-		pos.Hash ^= zobristEp[pos.EpSquare]
-		pos.EpSquare = -1
-	}
+	pos.clearEP()
 	pos.Side ^= 1
 	pos.Hash ^= zobristSide
 }
@@ -1037,69 +1009,63 @@ func (pos *Position) isDraw() bool {
 	}
 	wMinor := pos.PieceCnt[WKnight] + pos.PieceCnt[WBishop]
 	bMinor := pos.PieceCnt[BKnight] + pos.PieceCnt[BBishop]
-	return wMinor+bMinor <= 2 && wMinor <= 1 && bMinor <= 1
+	return wMinor <= 1 && bMinor <= 1
 }
 
 // ------------------
 // --- Evaluation ---
 // ------------------
 
-// Rook bonus helper
+// Rook file bonus, open (no pawns), semi-open (only enemy pawns), or none (own pawn blocks)
 func (pos *Position) rookFileBonus(side, f int) (mg, eg int) {
-	// Is there a own pawn in the way?
 	if pos.PawnFileCnt[side][f] != 0 {
-		// Pawn in the way
-		return 0, 0
+		return 0, 0 // own pawn blocks the file
 	}
-	// Is there enemy pawn in the way?
 	if pos.PawnFileCnt[side^1][f] == 0 {
-		// No pawn in the way
-		return rookOpenFileMg, rookOpenFileEg
+		return rookOpenFileMg, rookOpenFileEg // fully open
 	}
-	// No own pawn, but not empty for enemy pawn
-	// Enemy pawn in the way
-	return rookSemiOpenFileMg, rookSemiOpenFileEg
+	return rookSemiOpenFileMg, rookSemiOpenFileEg // semi-open (enemy pawn only)
 }
 
-// Isolated pawn helper
+// isoCount returns the pawns on file f with no friendly pawn on an adjacent file, 0 if off-board
 func (pos *Position) isoCount(c, f int) int {
-	// Is there a pawn?
 	if f < 0 || f > 7 || pos.PawnFileCnt[c][f] == 0 {
 		return 0
 	}
-	// Check neighbor files
-	if (f == 0 || pos.PawnFileCnt[c][f-1] == 0) && (f == 7 || pos.PawnFileCnt[c][f+1] == 0) {
-		// Neither file has neighbor pawn
+	noLeft := f == 0 || pos.PawnFileCnt[c][f-1] == 0
+	noRight := f == 7 || pos.PawnFileCnt[c][f+1] == 0
+	if noLeft && noRight {
 		return pos.PawnFileCnt[c][f]
 	}
-	// Has neighbor pawn(s)
 	return 0
 }
 
 // Apply changes to pawn file
 func (pos *Position) applyPawnFileChange(c, f, delta int) {
-	// Compute values, old and new
-	oldWMg, oldWEg := pos.rookFileBonus(White, f)
-	oldBMg, oldBEg := pos.rookFileBonus(Black, f)
+	// Copy affected terms before the change
+	var oldMg, oldEg [2]int
+	oldMg[White], oldEg[White] = pos.rookFileBonus(White, f)
+	oldMg[Black], oldEg[Black] = pos.rookFileBonus(Black, f)
 	oldIso := pos.isoCount(c, f-1) + pos.isoCount(c, f) + pos.isoCount(c, f+1)
 	oldCnt := pos.PawnFileCnt[c][f]
+
 	pos.PawnFileCnt[c][f] += delta
 	newCnt := pos.PawnFileCnt[c][f]
-	newWMg, newWEg := pos.rookFileBonus(White, f)
-	newBMg, newBEg := pos.rookFileBonus(Black, f)
-	nW := pos.RookFileCnt[White][f]
-	nB := pos.RookFileCnt[Black][f]
-	pos.MgScore[White] += nW * (newWMg - oldWMg)
-	pos.EgScore[White] += nW * (newWEg - oldWEg)
-	pos.MgScore[Black] += nB * (newBMg - oldBMg)
-	pos.EgScore[Black] += nB * (newBEg - oldBEg)
 
-	// Update doubled pawn score
+	// Rook open/semi-open bonus shift for each color's rooks on this file
+	for s := White; s <= Black; s++ {
+		newMg, newEg := pos.rookFileBonus(s, f)
+		n := pos.RookFileCnt[s][f]
+		pos.MgScore[s] += n * (newMg - oldMg[s])
+		pos.EgScore[s] += n * (newEg - oldEg[s])
+	}
+
+	// Doubled pawn score (penalty per pawn beyond the first)
 	diff := max(0, newCnt-1) - max(0, oldCnt-1)
 	pos.MgScore[c] += diff * doubledPawnMg
 	pos.EgScore[c] += diff * doubledPawnEg
 
-	// Update iso pawn score
+	// Isolated pawn score (a change on file f affects files f-1, f, f+1)
 	newIso := pos.isoCount(c, f-1) + pos.isoCount(c, f) + pos.isoCount(c, f+1)
 	pos.MgScore[c] += (newIso - oldIso) * isolatedPawnMg
 	pos.EgScore[c] += (newIso - oldIso) * isolatedPawnEg
@@ -1116,8 +1082,7 @@ func (pos *Position) applyRookFileChange(side, f, delta int) {
 // Evaluate position
 // Return from side to move perspective
 func (pos *Position) evaluate() int {
-	// Check current phase
-	phase := min(pos.Phase, maxPhase)
+	phase := min(pos.Phase, maxPhase) // Promotions can push Phase above maxPhase
 
 	// Compute evaluations from incrementally maintained values
 	mg := pos.MgScore[pos.Side] - pos.MgScore[pos.Side^1]
@@ -1161,7 +1126,7 @@ func scoreMove(pos *Position, m Move, pvMove, ttMove Move, ply int) int {
 	return history[pos.Side][m.from()][m.to()]
 }
 
-// Sort moves based on scores given
+// Move the best-scoring move in [current:] to index current
 func sortMoves(moves []Move, scores []int, current int) {
 	bestIdx := current
 	bestScore := scores[current]
@@ -1257,9 +1222,9 @@ func formatScore(score int) string {
 // Age history, halve all scores
 // TODO: Test if / 4 better
 func ageHistory() {
-	for side := 0; side < 2; side++ {
-		for from := 0; from < 128; from++ {
-			for to := 0; to < 128; to++ {
+	for side := range history {
+		for from := range history[side] {
+			for to := range history[side][from] {
 				history[side][from][to] /= 2
 			}
 		}
