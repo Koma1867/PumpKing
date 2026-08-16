@@ -285,6 +285,22 @@ func isSqValid(sq int) bool   { return (sq & 0x88) == 0 }   // Off-board check v
 func flipSq(sq int) int       { return sq ^ 0x70 }          // Mirror square vertically
 func pawnPush(side int) int   { return 16 - side*32 }       // +16 White, -16 Black
 
+// Quadrant of square: 0=WQ(a1-d4), 1=WK(e1-h4), 2=BQ(a5-d8), 3=BK(e5-h8)
+func quadrantOf(sq int) int {
+	return ((sq >> 5) & 2) | ((sq >> 2) & 1)
+}
+
+// isKingQuadrantIntrusion checks if a major/minor piece moves from outside
+// into the quadrant of the defending king.
+func (pos *Position) isKingQuadrantIntrusion(m Move) bool {
+	p := pos.Board[m.from()]
+	if p == WPawn || p == BPawn || p == WKing || p == BKing {
+		return false
+	}
+	enemyKingQuad := quadrantOf(pos.KingSq[pos.Side^1])
+	return quadrantOf(m.to()) == enemyKingQuad && quadrantOf(m.from()) != enemyKingQuad
+}
+
 // Piece colors per piece
 var pieceColorTable = [13]int{-1, White, White, White, White, White, White, Black, Black, Black, Black, Black, Black}
 
@@ -1440,6 +1456,12 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 		m := moves[i]
 		mover := pos.Side
 
+		// King Quadrant Intrusion Extension
+		ext := 0
+		if !inCheck && depth >= 2 && pos.isKingQuadrantIntrusion(m) {
+			ext = 1
+		}
+
 		if !pos.makeMove(m, &undo) {
 			continue
 		}
@@ -1449,11 +1471,11 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 		var line []Move
 		var score int
 		if legalMoves == 1 {
-			score = -alphaBeta(pos, -beta, -alpha, depth-1, ply+1, NoMove, &line, m)
+			score = -alphaBeta(pos, -beta, -alpha, depth-1+ext, ply+1, NoMove, &line, m)
 		} else {
 			// Late move reductions
-			nd := depth - 1
-			if legalMoves > lmrMinLegalMoves && depth >= lmrMinDepth && !m.isCapture() && m.promoted() == Empty && !inCheck {
+			nd := depth - 1 + ext
+			if legalMoves > lmrMinLegalMoves && depth >= lmrMinDepth && !m.isCapture() && m.promoted() == Empty && !inCheck && ext == 0 {
 				R := 1
 				// Depth higher than or equal to 6?
 				if depth >= lmrDepthBumpAt {
@@ -1468,14 +1490,14 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 			// Null-window scout
 			score = -alphaBeta(pos, -alpha-1, -alpha, nd, ply+1, NoMove, &line, m)
 			// Beat alpha while reduced? Re-search full depth
-			if score > alpha && nd < depth-1 {
+			if score > alpha && nd < depth-1+ext {
 				line = nil
-				score = -alphaBeta(pos, -alpha-1, -alpha, depth-1, ply+1, NoMove, &line, m)
+				score = -alphaBeta(pos, -alpha-1, -alpha, depth-1+ext, ply+1, NoMove, &line, m)
 			}
 			// Beat alpha at a PV node? Re-search full window
 			if score > alpha && score < beta {
 				line = nil
-				score = -alphaBeta(pos, -beta, -alpha, depth-1, ply+1, NoMove, &line, m)
+				score = -alphaBeta(pos, -beta, -alpha, depth-1+ext, ply+1, NoMove, &line, m)
 			}
 		}
 		pos.unmakeMove(m, &undo)
