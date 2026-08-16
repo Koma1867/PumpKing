@@ -2,8 +2,8 @@
 // Author: 				Otto Laukkanen
 //
 // Board:   			0x88 with precomputed leaper tables and piece lists
-// Search:  			Alpha-Beta + Iterative Deepening + Quiescence + Check Extensions + TT + PVS
-// Prune:   			Late Move Reductions, Null Move Pruning, Reverse Futility Pruning
+// Search:  			Alpha-Beta + Iterative Deepening + Quiescence + Check Extensions + TT + PVS + King Extensions
+// Prune:   			Late Move Reductions, Null Move Pruning, Reverse Futility Pruning + Countermove
 // Eval:    			Tapered HCE (Material + PSTs, Tempo, Rook-file bonus, Doubled pawn, Bishop pair, isolated pawn)
 
 package main
