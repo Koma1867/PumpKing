@@ -95,6 +95,11 @@ func waitForSearch() {
 // (to)
 var history [2][128][128]int
 
+// Countermove heuristic
+// (piece)
+// (to)
+var countermoves [13][128]Move
+
 // Killer moves
 // (ply)
 // (0=primary, 1=secondary)
@@ -162,11 +167,12 @@ var pstEg [13][128]int
 
 // Ordering constants
 const (
-	scorePVMove   = 10_000_000        // PV move
-	scoreCapBase  = 1_000_000         // Base score for captures
-	scoreKillerA  = scoreCapBase + 50 // Killer A slot, just below worst capture
-	scoreKillerB  = scoreCapBase + 10 // Killer B slot
-	mvvMultiplier = 100               // Victim value multiplier
+	scorePVMove      = 10_000_000        // PV move
+	scoreCapBase     = 1_000_000         // Base score for captures
+	scoreKillerA     = scoreCapBase + 50 // Killer A slot, just below worst capture
+	scoreKillerB     = scoreCapBase + 10 // Killer B slot
+	scoreCountermove = scoreCapBase + 5  // Countermove slot, just below killers
+	mvvMultiplier    = 100               // Victim value multiplier
 )
 
 // MVV-LVA lookup values
@@ -1099,7 +1105,7 @@ func (pos *Position) evaluate() int {
 // ---------------------
 
 // Assign ordering scores
-func scoreMove(pos *Position, m Move, pvMove, ttMove Move, ply int) int {
+func scoreMove(pos *Position, m Move, pvMove, ttMove Move, ply int, prevMove Move) int {
 	// Previous best move?
 	if m == pvMove {
 		return scorePVMove
@@ -1121,6 +1127,10 @@ func scoreMove(pos *Position, m Move, pvMove, ttMove Move, ply int) int {
 	// Killer B?
 	if m == killers[ply][1] {
 		return scoreKillerB
+	}
+	// Countermove?
+	if prevMove != NoMove && m == countermoves[pos.Board[prevMove.to()]][prevMove.to()] {
+		return scoreCountermove
 	}
 	// History score
 	return history[pos.Side][m.from()][m.to()]
@@ -1231,10 +1241,11 @@ func ageHistory() {
 	}
 }
 
-// Clear history
+// Clear history and countermoves
 // Go zero initializes
 func clearHistory() {
 	history = [2][128][128]int{}
+	countermoves = [13][128]Move{}
 }
 
 // Update history scores
@@ -1297,7 +1308,7 @@ func quiescence(pos *Position, alpha, beta int) int {
 	var scoreBuf [maxMoves]int
 	scores := scoreBuf[:len(moves)]
 	for i, m := range moves {
-		scores[i] = scoreMove(pos, m, NoMove, NoMove, 0)
+		scores[i] = scoreMove(pos, m, NoMove, NoMove, 0, NoMove)
 	}
 
 	var undo UndoInfo
@@ -1330,7 +1341,7 @@ func quiescence(pos *Position, alpha, beta int) int {
 }
 
 // Search through moves with negamax
-func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *[]Move) int {
+func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *[]Move, prevMove Move) int {
 	// Clear PV line
 	*pvLine = nil
 
@@ -1388,7 +1399,7 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 		var nullUndo UndoInfo
 		pos.makeNullMove(&nullUndo)
 		var nullPv []Move
-		score := -alphaBeta(pos, -beta, -beta+1, depth-1-NullMoveReduction, ply+1, NoMove, &nullPv)
+		score := -alphaBeta(pos, -beta, -beta+1, depth-1-NullMoveReduction, ply+1, NoMove, &nullPv, NoMove)
 		pos.unmakeNullMove(&nullUndo)
 		// Check if search should stop
 		if abortSearch.Load() {
@@ -1415,7 +1426,7 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 	scores := scoreBuf[:len(moves)]
 	// Order moves
 	for i, m := range moves {
-		scores[i] = scoreMove(pos, m, pvMove, ttMove, ply)
+		scores[i] = scoreMove(pos, m, pvMove, ttMove, ply, prevMove)
 	}
 
 	var undo UndoInfo
@@ -1438,7 +1449,7 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 		var line []Move
 		var score int
 		if legalMoves == 1 {
-			score = -alphaBeta(pos, -beta, -alpha, depth-1, ply+1, NoMove, &line)
+			score = -alphaBeta(pos, -beta, -alpha, depth-1, ply+1, NoMove, &line, m)
 		} else {
 			// Late move reductions
 			nd := depth - 1
@@ -1455,16 +1466,16 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 				nd = max(depth-1-R, 1)
 			}
 			// Null-window scout
-			score = -alphaBeta(pos, -alpha-1, -alpha, nd, ply+1, NoMove, &line)
+			score = -alphaBeta(pos, -alpha-1, -alpha, nd, ply+1, NoMove, &line, m)
 			// Beat alpha while reduced? Re-search full depth
 			if score > alpha && nd < depth-1 {
 				line = nil
-				score = -alphaBeta(pos, -alpha-1, -alpha, depth-1, ply+1, NoMove, &line)
+				score = -alphaBeta(pos, -alpha-1, -alpha, depth-1, ply+1, NoMove, &line, m)
 			}
 			// Beat alpha at a PV node? Re-search full window
 			if score > alpha && score < beta {
 				line = nil
-				score = -alphaBeta(pos, -beta, -alpha, depth-1, ply+1, NoMove, &line)
+				score = -alphaBeta(pos, -beta, -alpha, depth-1, ply+1, NoMove, &line, m)
 			}
 		}
 		pos.unmakeMove(m, &undo)
@@ -1489,6 +1500,9 @@ func alphaBeta(pos *Position, alpha, beta, depth, ply int, pvMove Move, pvLine *
 						if killers[ply][0] != m {
 							killers[ply][1] = killers[ply][0]
 							killers[ply][0] = m
+						}
+						if prevMove != NoMove {
+							countermoves[pos.Board[prevMove.to()]][prevMove.to()] = m
 						}
 					}
 					break
@@ -1550,7 +1564,7 @@ func search(pos *Position, maxDepth int, maxNodes uint64) Move {
 
 		for retries := 0; retries < aspirationMaxRetries; retries++ {
 			pv = nil
-			score = alphaBeta(pos, alpha, beta, depth, 0, pvMove, &pv)
+			score = alphaBeta(pos, alpha, beta, depth, 0, pvMove, &pv, NoMove)
 			if abortSearch.Load() || (score > alpha && score < beta) {
 				break
 			}
@@ -1565,7 +1579,7 @@ func search(pos *Position, maxDepth int, maxNodes uint64) Move {
 		// All retries done, just go full window
 		if !abortSearch.Load() && (score <= alpha || score >= beta) {
 			pv = nil
-			score = alphaBeta(pos, -infScore, infScore, depth, 0, pvMove, &pv)
+			score = alphaBeta(pos, -infScore, infScore, depth, 0, pvMove, &pv, NoMove)
 		}
 
 		// Check if should stop
